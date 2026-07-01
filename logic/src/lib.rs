@@ -83,6 +83,13 @@ impl MergeableTrait for Presence {
     }
 }
 
+// rc.9 made `Mergeable: RekeyTarget`. `Presence` is a plain-data LWW value with
+// no nested collections, so re-keying is a no-op — exactly like core's own
+// `LwwRegister`. Registration cascades into nothing, so the default suffices.
+impl calimero_storage::collections::rekey::RekeyTarget for Presence {
+    fn rekey_relative_to(&mut self, _parent_id: calimero_storage::address::Id) {}
+}
+
 // ── Signaling ───────────────────────────────────────────────────────────────
 
 /// A single WebRTC signaling message, addressed from one peer to another.
@@ -117,6 +124,12 @@ impl MergeableTrait for Signal {
         }
         Ok(())
     }
+}
+
+// See the `Presence` note above: `Signal` is likewise an immutable, id-keyed
+// LWW value with no nested collections, so its re-key is a no-op.
+impl calimero_storage::collections::rekey::RekeyTarget for Signal {
+    fn rekey_relative_to(&mut self, _parent_id: calimero_storage::address::Id) {}
 }
 
 // ── Views (read-model returned to the frontend) ───────────────────────────────
