@@ -87,11 +87,15 @@ cat > res/bundle-temp/manifest.json <<EOF
 }
 EOF
 
-# Sign the manifest via core workspace tool, using the shared publisher key that
-# lives inside the mero-chat repo (the same signer owns the other mero apps).
-cargo run --manifest-path ../../core/Cargo.toml -p mero-sign --quiet -- \
-    sign res/bundle-temp/manifest.json \
-    --key ../../mero-chat/logic/key.json
+# Sign the manifest. MANDATORY (set -e) — the registry rejects an unsigned
+# bundle. Prefer the installed `mero-sign` binary; fall back to building it from
+# a sibling core checkout. Key defaults to the publisher keypair committed in
+# mero-chat (the same signer owns the other mero apps); override SIGNING_KEY.
+MERO_SIGN="$(command -v mero-sign || true)"
+[ -n "$MERO_SIGN" ] || MERO_SIGN="cargo run --manifest-path ../../core/Cargo.toml -p mero-sign --quiet --"
+SIGNING_KEY="${SIGNING_KEY:-../../mero-chat/logic/key.json}"
+$MERO_SIGN sign res/bundle-temp/manifest.json --key "$SIGNING_KEY"
+echo "Manifest signed with $SIGNING_KEY"
 
 # Create .mpk bundle (tar.gz archive). Filename derives from APP_VERSION so it
 # never drifts from the manifest appVersion.
