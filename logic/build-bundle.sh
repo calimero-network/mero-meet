@@ -98,14 +98,14 @@ cat > res/bundle-temp/manifest.json <<EOF
 }
 EOF
 
-# Sign the manifest if mero-sign is available (same key as the other mero apps).
-if cargo run --manifest-path ../../core/Cargo.toml -p mero-sign --quiet -- \
+# Sign the manifest via the core workspace tool. Signing is MANDATORY — the
+# registry rejects an unsigned bundle ("missing signature") — so this must fail
+# the build (via `set -e`) rather than silently shipping an unsigned .mpk.
+# Same key as the other mero apps (curb/merodesign).
+cargo run --manifest-path ../../core/Cargo.toml -p mero-sign --quiet -- \
     sign res/bundle-temp/manifest.json \
-    --key ../../core/scripts/test-signing-key/test-key.json 2>/dev/null; then
-    echo "Manifest signed"
-else
-    echo "mero-sign not available — skipping signing (non-fatal for local dev)"
-fi
+    --key ../../core/scripts/test-signing-key/test-key.json
+echo "Manifest signed"
 
 BUNDLE="mero-meet-${APP_VERSION}.mpk"
 ( cd res/bundle-temp && tar -czf "../${BUNDLE}" manifest.json app.wasm )
