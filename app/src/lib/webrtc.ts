@@ -30,13 +30,17 @@ export interface DiagEntry {
   msg: string;
 }
 
-/** Per-peer connection snapshot for the developer-mode diagnostics overlay. */
+/** Per-peer connection snapshot for diagnostics and the media-flow watchdog. */
 export interface PeerStat {
   peerId: string;
   connection: RTCPeerConnectionState;
   ice: RTCIceConnectionState;
   outboundKbps: number;
   inboundKbps: number;
+  /** Cumulative RTP bytes — safe for multiple concurrent getStats consumers
+   *  (the kbps fields share delta state and are only accurate for one). */
+  outboundBytes: number;
+  inboundBytes: number;
 }
 
 export interface CallEngineCallbacks {
@@ -46,6 +50,13 @@ export interface CallEngineCallbacks {
   onPeerStateChange?(peerId: string, state: RTCPeerConnectionState): void;
   /** Developer-mode only: structured diagnostics. Never shown to normal users. */
   onDiag?(entry: DiagEntry): void;
+  /**
+   * Fetch a fresh ICE server list (e.g. re-mint Cloudflare TURN credentials —
+   * they are short-lived, and per Cloudflare's docs must be refreshed via
+   * `setConfiguration()` for long sessions). Called before ICE restarts and
+   * peer rebuilds; return null to keep the current list.
+   */
+  getIceServers?(): Promise<RTCIceServer[] | null>;
 }
 
 interface PeerState {
@@ -133,6 +144,39 @@ export class CallEngine {
   }
 
   /**
+   * Re-fetch ICE servers before a recovery attempt. TURN credentials
+   * (Cloudflare's are short-TTL) can expire mid-call — an ICE restart with
+   * the join-time credentials then fails relay allocation forever, which
+   * looks like "the call worked and then could never reconnect".
+   */
+  private async refreshIceServers(): Promise<void> {
+    if (!this.cbs.getIceServers) return;
+    try {
+      const fresh = await this.cbs.getIceServers();
+      if (fresh && fresh.length) this.iceServers = fresh;
+    } catch {
+      /* keep the current list */
+    }
+  }
+
+  /** MDN-recommended restart sequence: setConfiguration(fresh) → restartIce(). */
+  private restartIceFresh(peerId: string, state: PeerState): void {
+    void this.refreshIceServers().then(() => {
+      if (this.peers.get(peerId) !== state) return; // rebuilt/left meanwhile
+      try {
+        state.pc.setConfiguration({ iceServers: this.iceServers });
+      } catch {
+        /* some webviews reject mid-call config changes — restart anyway */
+      }
+      try {
+        state.pc.restartIce();
+      } catch {
+        /* pc may be closing */
+      }
+    });
+  }
+
+  /**
    * Developer-mode only: snapshot each peer connection (state + throughput).
    * Pulled on an interval by the diagnostics overlay; no effect on the call.
    */
@@ -162,6 +206,8 @@ export class CallEngine {
         ice: pc.iceConnectionState,
         outboundKbps: Math.max(0, Math.round(outKbps)),
         inboundKbps: Math.max(0, Math.round(inKbps)),
+        outboundBytes: bytesOut,
+        inboundBytes: bytesIn,
       });
     }
     return out;
@@ -376,7 +422,7 @@ export class CallEngine {
         const restart = () => {
           if (this.peers.get(peerId) !== state || pc.connectionState !== "failed") return;
           this.diag("peer", `${peerId.slice(0, 8)} failed → restarting ICE${lead ? "" : " (backstop)"}`);
-          try { pc.restartIce(); } catch { /* pc may be closing */ }
+          this.restartIceFresh(peerId, state);
         };
         if (fuse === 0) restart();
         else setTimeout(restart, fuse);
@@ -384,7 +430,7 @@ export class CallEngine {
         setTimeout(() => {
           if (this.peers.get(peerId) === state && pc.connectionState === "disconnected") {
             this.diag("peer", `${peerId.slice(0, 8)} still disconnected → restarting ICE`);
-            try { pc.restartIce(); } catch { /* pc may be closing */ }
+            this.restartIceFresh(peerId, state);
           }
         }, lead ? 2500 : 6000);
       }
@@ -401,7 +447,7 @@ export class CallEngine {
           );
           // keepStream: leave the last frame on the tile under "reconnecting…".
           this.closePeer(peerId, "rebuilding", true);
-          this.addPeer(peerId);
+          void this.refreshIceServers().then(() => this.addPeer(peerId));
         }, rebuildAfter);
       }
     };
@@ -519,6 +565,22 @@ export class CallEngine {
   }
 
   /**
+   * Rebuild ONE peer from scratch (fresh pc + fresh TURN credentials + a new
+   * offer/answer handshake), keeping the tile's last frame. Used by the
+   * one-way-media watchdog: a connection can report "connected" while RTP
+   * flows in only one direction (asymmetric NAT/relay failure) — one side
+   * sees both cameras, the other sees only themselves.
+   */
+  rebuildPeer(peerId: string, reason = "one-way media"): void {
+    if (!this.peers.has(peerId)) return;
+    this.diag("peer", `${peerId.slice(0, 8)} rebuild requested (${reason})`);
+    this.closePeer(peerId, reason, true);
+    void this.refreshIceServers().then(() => {
+      if (!this.peers.has(peerId)) this.addPeer(peerId);
+    });
+  }
+
+  /**
    * Manual force-reconnect: tear down and re-negotiate EVERY peer connection
    * from scratch (fresh pc, fresh offer/answer). Streams are kept on the
    * tiles under "reconnecting…" until the rebuilt connection's ontrack
@@ -529,10 +591,10 @@ export class CallEngine {
     const ids = [...this.peers.keys()];
     this.diag("info", `force reconnect — rebuilding ${ids.length} peer connection(s)`);
     this.recentlyLeft.clear();
-    for (const id of ids) {
-      this.closePeer(id, "force reconnect", true);
-      this.addPeer(id);
-    }
+    for (const id of ids) this.closePeer(id, "force reconnect", true);
+    void this.refreshIceServers().then(() => {
+      for (const id of ids) if (!this.peers.has(id)) this.addPeer(id);
+    });
   }
 
   /** Announce departure to peers and tear everything down. */

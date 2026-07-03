@@ -56,7 +56,14 @@ class FakePC {
   onnegotiationneeded: (() => void | Promise<void>) | null = null;
   onconnectionstatechange: (() => void) | null = null;
   restartIce = vi.fn();
+  setConfiguration = vi.fn((c: { iceServers?: unknown[] }) => void (this.config = c));
   closed = false;
+  /** Test hook: entries returned by getStats() (report-shaped). */
+  statsEntries: Array<{ type: string; bytesSent?: number; bytesReceived?: number }> = [];
+  async getStats() {
+    const entries = this.statsEntries;
+    return { forEach: (fn: (e: unknown) => void) => entries.forEach(fn) };
+  }
   private senders: { track: unknown; replaceTrack: ReturnType<typeof vi.fn> }[] = [];
   private negotiationQueued = false;
 
@@ -311,6 +318,7 @@ describe("ghost-peer reconnection ladder", () => {
     const pc = FakePC.all[0];
 
     pc.setConn("failed");
+    await vi.advanceTimersByTimeAsync(0); // restart hops through the async cred refresh
     expect(pc.restartIce).toHaveBeenCalledTimes(1);
 
     // Unhealed for 8s → the wedged pc is torn down and a NEW one negotiates.
@@ -483,6 +491,54 @@ describe("non-trickle ICE bundling", () => {
 
     await vi.advanceTimersByTimeAsync(2000); // gathering cap elapses
     expect(signals.filter((s) => s.kind === "offer")).toHaveLength(1); // sent anyway
+  });
+});
+
+describe("TURN credential refresh (short-TTL relay creds)", () => {
+  const FRESH: RTCIceServer[] = [{ urls: "turn:fresh.example.com", username: "u2", credential: "c2" }];
+
+  it("re-mints ICE servers and applies them via setConfiguration before an ICE restart", async () => {
+    const { engine, cbs } = makeEngine();
+    (cbs as { getIceServers?: () => Promise<RTCIceServer[] | null> }).getIceServers = vi.fn(async () => FRESH);
+    engine.syncPeers([PEER_IMPOLITE]); // impolite → leads recovery immediately
+    const pc = FakePC.all[0];
+
+    pc.setConn("failed");
+    await flush();
+
+    // MDN sequence: setConfiguration(fresh) → restartIce().
+    expect(pc.setConfiguration).toHaveBeenCalledWith({ iceServers: FRESH });
+    expect(pc.restartIce).toHaveBeenCalledTimes(1);
+  });
+
+  it("a from-scratch rebuild constructs the new pc with the refreshed servers", async () => {
+    vi.useFakeTimers();
+    const { engine, cbs } = makeEngine();
+    (cbs as { getIceServers?: () => Promise<RTCIceServer[] | null> }).getIceServers = vi.fn(async () => FRESH);
+    engine.syncPeers([PEER_IMPOLITE]);
+    FakePC.all[0].setConn("failed");
+
+    await vi.advanceTimersByTimeAsync(8000); // leader's rebuild window
+    expect(FakePC.all.length).toBe(2);
+    expect((FakePC.all[1].config as { iceServers: unknown }).iceServers).toEqual(FRESH);
+  });
+
+  it("rebuildPeer (one-way media watchdog path) rebuilds a single peer with fresh creds", async () => {
+    const { engine, cbs } = makeEngine();
+    (cbs as { getIceServers?: () => Promise<RTCIceServer[] | null> }).getIceServers = vi.fn(async () => FRESH);
+    engine.syncPeers([PEER_POLITE, PEER_IMPOLITE]);
+    const target = FakePC.all[0];
+    target.setConn("connected");
+
+    engine.rebuildPeer(PEER_POLITE, "no inbound media");
+    await flush();
+
+    expect(target.closed).toBe(true);
+    expect(FakePC.all.length).toBe(3); // only the target was rebuilt
+    expect(FakePC.all[1].closed).toBe(false);
+    expect(await peerCount(engine)).toBe(2);
+    // Tile keeps its last frame while the fresh handshake runs.
+    expect(cbs.onRemoteStream).not.toHaveBeenCalledWith(PEER_POLITE, null);
   });
 });
 

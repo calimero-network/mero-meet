@@ -60,6 +60,24 @@ const HEARTBEAT_MS = 3_000;
 // If the contract roster loses us (a reap misfire, someone's stale end_call,
 // gossip hiccup), re-assert membership via start_call — but at most this often.
 const REASSERT_MS = 5_000;
+// One-way media watchdog: a peer connection can report "connected" while RTP
+// flows in only ONE direction (asymmetric NAT / expired relay allocation) —
+// one side sees both cameras, the other only themselves. Sample byte counters
+// every WATCHDOG_SAMPLE_MS; after WATCHDOG_STRIKES consecutive zero-flow
+// samples in an expected direction, rebuild that peer (fresh TURN credentials
+// + a clean handshake), at most once per cooldown.
+const WATCHDOG_SAMPLE_MS = 2_500;
+const WATCHDOG_STRIKES = 4;
+const WATCHDOG_COOLDOWN_MS = 30_000;
+
+interface FlowSample {
+  inBytes: number;
+  outBytes: number;
+  strikesIn: number;
+  strikesOut: number;
+  lastSampleAt: number;
+  lastRebuildAt: number;
+}
 
 /**
  * Drives the (single) active call, independent of which page is showing. Lives in
@@ -127,6 +145,13 @@ export function useCallController(): CallController {
   // RPC health flags, so failures log on TRANSITION instead of every poll.
   const drainFailedRef = useRef<boolean>(false);
   const rosterFailedRef = useRef<boolean>(false);
+  // One-way media watchdog state (see WATCHDOG_* above). Mirrors of the
+  // mute/camera state + presence live in refs so the poll closure (whose deps
+  // must stay stable) always reads current values.
+  const flowRef = useRef<Map<string, FlowSample>>(new Map());
+  const mutedRef = useRef(false);
+  const videoOnRef = useRef(true);
+  const presenceRef = useRef<Map<string, Presence>>(new Map());
 
   // Controller-level diagnostics (roster/effect/lifecycle), interleaved with the
   // engine's own signal/peer logs in the same closable log popup.
@@ -259,6 +284,7 @@ export function useCallController(): CallController {
     if (lobby) {
       for (const m of lobby.members) presenceMap.set(m.memberId, m);
       setPresence(presenceMap);
+      presenceRef.current = presenceMap;
       if (lobby.room?.name) setRoomName(lobby.room.name);
       // Liveness observation: their presence row MOVED (any change of
       // updatedAt — we never compare their clock to ours, which broke under
@@ -374,6 +400,67 @@ export function useCallController(): CallController {
     });
   }, [selfId, pushDiag]);
 
+  // ── One-way media watchdog ───────────────────────────────────────────────────
+  const checkMediaFlow = useCallback(async () => {
+    const engine = engineRef.current;
+    if (!engine || !seededRef.current) return;
+    const now = Date.now();
+    const stats = await engine.getStats();
+    const seen = new Set<string>();
+    for (const st of stats) {
+      seen.add(st.peerId);
+      let f = flowRef.current.get(st.peerId);
+      if (!f) {
+        f = {
+          inBytes: st.inboundBytes,
+          outBytes: st.outboundBytes,
+          strikesIn: 0,
+          strikesOut: 0,
+          lastSampleAt: now,
+          lastRebuildAt: 0,
+        };
+        flowRef.current.set(st.peerId, f);
+        continue;
+      }
+      if (now - f.lastSampleAt < WATCHDOG_SAMPLE_MS) continue;
+      const inDelta = st.inboundBytes - f.inBytes;
+      const outDelta = st.outboundBytes - f.outBytes;
+      f.inBytes = st.inboundBytes;
+      f.outBytes = st.outboundBytes;
+      f.lastSampleAt = now;
+      if (st.connection !== "connected") {
+        // Not connected → the recovery ladder owns it; don't double-trigger.
+        f.strikesIn = 0;
+        f.strikesOut = 0;
+        continue;
+      }
+      // Inbound is only expected while the peer claims an unmuted mic or a
+      // live camera (a muted+camera-off peer legitimately sends ~nothing).
+      const p = presenceRef.current.get(st.peerId);
+      const expectIn = p ? !p.muted || p.videoOn : true;
+      const expectOut = !mutedRef.current || videoOnRef.current;
+      f.strikesIn = expectIn && inDelta <= 0 ? f.strikesIn + 1 : 0;
+      f.strikesOut = expectOut && outDelta <= 0 ? f.strikesOut + 1 : 0;
+      if (
+        (f.strikesIn >= WATCHDOG_STRIKES || f.strikesOut >= WATCHDOG_STRIKES) &&
+        now - f.lastRebuildAt > WATCHDOG_COOLDOWN_MS
+      ) {
+        const dir = f.strikesIn >= WATCHDOG_STRIKES ? "no inbound media" : "no outbound media";
+        pushDiag(
+          "error",
+          `${st.peerId.slice(0, 8)} connected but ${dir} for ~${Math.round((WATCHDOG_STRIKES * WATCHDOG_SAMPLE_MS) / 1000)}s — rebuilding (one-way media)`,
+        );
+        f.lastRebuildAt = now;
+        f.strikesIn = 0;
+        f.strikesOut = 0;
+        engine.rebuildPeer(st.peerId, dir);
+      }
+    }
+    for (const id of [...flowRef.current.keys()]) {
+      if (!seen.has(id)) flowRef.current.delete(id);
+    }
+  }, [pushDiag]);
+
   // ── Start / stop the call machinery when `active` flips ──────────────────────
   useEffect(() => {
     if (!active) return;
@@ -411,6 +498,9 @@ export function useCallController(): CallController {
           const next = prev.length >= MAX_DIAG ? prev.slice(prev.length - MAX_DIAG + 1) : prev;
           return [...next, entry];
         }),
+      // Re-mint TURN credentials before ICE restarts/rebuilds — Cloudflare's
+      // are short-TTL, and a mid-call expiry made every later reconnect fail.
+      getIceServers: () => invokeTauri<RTCIceServer[]>("get_ice_servers").catch(() => null),
     });
     engineRef.current = engine;
 
@@ -492,6 +582,8 @@ export function useCallController(): CallController {
       lastReassertRef.current = 0;
       drainFailedRef.current = false;
       rosterFailedRef.current = false;
+      flowRef.current = new Map();
+      presenceRef.current = new Map();
       setEffectState("none");
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -529,6 +621,7 @@ export function useCallController(): CallController {
       if (stopped) return;
       void drainSignals();
       void syncRoster();
+      void checkMediaFlow();
       const states = [...peerStatesRef.current.values()];
       const handshaking = states.some((s) => s !== "connected");
       timer = setTimeout(tick, handshaking ? SIGNAL_POLL_FAST_MS : SIGNAL_POLL_MS);
@@ -564,12 +657,13 @@ export function useCallController(): CallController {
       window.removeEventListener("pagehide", onHide);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [active, drainSignals, syncRoster]);
+  }, [active, drainSignals, syncRoster, checkMediaFlow]);
 
   // ── Controls ─────────────────────────────────────────────────────────────────
   const toggleMute = useCallback(() => {
     setMuted((m) => {
       const next = !m;
+      mutedRef.current = next;
       engineRef.current?.setMuted(next);
       void meetRef.current.setState({ muted: next });
       return next;
@@ -579,6 +673,7 @@ export function useCallController(): CallController {
   const toggleVideo = useCallback(() => {
     setVideoOn((v) => {
       const next = !v;
+      videoOnRef.current = next;
       engineRef.current?.setVideo(next);
       void meetRef.current.setState({ video_on: next });
       return next;

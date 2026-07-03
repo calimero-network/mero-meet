@@ -96,7 +96,14 @@ class FakePC {
   onnegotiationneeded: (() => void | Promise<void>) | null = null;
   onconnectionstatechange: (() => void) | null = null;
   restartIce = vi.fn();
+  setConfiguration = vi.fn();
   closed = false;
+  /** Test hook: entries returned by getStats() (report-shaped). */
+  statsEntries: Array<{ type: string; bytesSent?: number; bytesReceived?: number }> = [];
+  async getStats() {
+    const entries = this.statsEntries;
+    return { forEach: (fn: (e: unknown) => void) => entries.forEach(fn) };
+  }
   private senders: { track: unknown; replaceTrack: ReturnType<typeof vi.fn> }[] = [];
   private negotiationQueued = false;
 
@@ -713,6 +720,63 @@ describe("provider-not-ready recovery (the F5 wedge)", () => {
     const before = meet.counts.heartbeat;
     await tick(30_000);
     expect(meet.counts.heartbeat - before).toBeGreaterThanOrEqual(9);
+    h.unmount();
+  });
+});
+
+describe("one-way media watchdog", () => {
+  it("rebuilds a peer that is 'connected' but receives NO media (they'd see us, we'd see black)", async () => {
+    const h = renderHook();
+    await startCall(h);
+    meet.roster = [SELF, PEER];
+    meet.members = [presenceRow(SELF, 100), presenceRow(PEER, 100)]; // camera on
+    await tick(1000);
+    const pc = FakePC.all.find((c) => !c.closed)!;
+    pc.setConn("connected");
+    // Outbound flows; inbound is flat-zero despite their camera being on.
+    pc.statsEntries = [
+      { type: "outbound-rtp", bytesSent: 1 },
+      { type: "inbound-rtp", bytesReceived: 0 },
+    ];
+    const grow = setInterval(() => {
+      pc.statsEntries[0].bytesSent! += 5000;
+    }, 1000);
+    const before = FakePC.all.length;
+
+    await tick(25_000); // 4 zero-flow samples @2.5s + poll cadence + cooldown slack
+    clearInterval(grow);
+
+    expect(FakePC.all.length).toBeGreaterThan(before); // peer was rebuilt
+    expect(pc.closed).toBe(true);
+    expect(
+      h.result.current.diagnostics.some((d) => d.msg.includes("one-way media")),
+    ).toBe(true);
+    h.unmount();
+  });
+
+  it("does NOT rebuild a silent peer whose mic is muted and camera is off (legitimately idle)", async () => {
+    const h = renderHook();
+    await startCall(h);
+    meet.roster = [SELF, PEER];
+    meet.members = [
+      presenceRow(SELF, 100),
+      presenceRow(PEER, 100, { muted: true, videoOn: false }),
+    ];
+    await tick(1000);
+    const pc = FakePC.all.find((c) => !c.closed)!;
+    pc.setConn("connected");
+    pc.statsEntries = [
+      { type: "outbound-rtp", bytesSent: 1 },
+      { type: "inbound-rtp", bytesReceived: 0 }, // silent — but that's expected
+    ];
+    const grow = setInterval(() => {
+      pc.statsEntries[0].bytesSent! += 5000;
+    }, 1000);
+
+    await tick(25_000);
+    clearInterval(grow);
+
+    expect(pc.closed).toBe(false); // no false-positive rebuild
     h.unmount();
   });
 });
