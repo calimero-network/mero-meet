@@ -40,7 +40,16 @@ function hasDevSession(): boolean {
   if (!import.meta.env.DEV) return false;
   try {
     const p = new URLSearchParams(window.location.hash.slice(1));
-    return Boolean((p.get("node_url") ?? p.get("nodeUrl")) && p.get("access_token"));
+    if ((p.get("node_url") ?? p.get("nodeUrl")) && p.get("access_token")) {
+      // Persist for this window's lifetime: MeroProvider strips the hash after
+      // auth, so a mid-call F5 arrives hash-less and used to dead-end on the
+      // landing page. sessionStorage survives a refresh but not a window close
+      // — the same semantics as the desktop webview, whose Tauri globals also
+      // survive a reload. (Dev-only: unreachable in production builds.)
+      sessionStorage.setItem("mm-dev-session", "1");
+      return true;
+    }
+    return sessionStorage.getItem("mm-dev-session") === "1";
   } catch {
     return false;
   }

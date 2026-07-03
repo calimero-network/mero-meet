@@ -49,15 +49,21 @@ Don't want to click through two windows at all? With the nodes and vite running:
 ```bash
 make dev-nodes                  # once
 make dev                        # separate terminal (or any port: DEV_VITE_PORT=…)
-make dev-e2e                    # headless, asserted, ~3 min
+make dev-e2e                    # headless, asserted, ~6 min (SKIP_CRASH=1 ≈ 3 min)
 ```
 
 It drives both peers with Playwright (fake cameras, isolated browser contexts)
 and **asserts real video frames flow**, through the exact lifecycle that has
-broken before: join → media both ways → leave (remote tile must disappear) →
-rejoin in BOTH directions → everyone leaves → the call must die ("Start call"
-again). On failure it dumps screenshots, per-peer browser consoles, and each
-peer's in-call diagnostics (the ⚙ log) to `/tmp/meet-dev-e2e/`.
+broken before, in ten phases: join → media both ways → leave (remote tile must
+disappear) → rejoin in BOTH directions → rapid leave-and-instantly-rejoin churn
+(recently-left suppression bypass) → mute propagating to the other tile → force
+reconnect (redial) → F5 mid-call (must auto-rejoin with no clicks) → everyone
+leaves → the call must die ("Start call" again) → and an ungraceful renderer
+**crash** (no leave, no bye — heartbeats just stop): the survivor must shed the
+ghost tile and the contract reaper must kill the phantom call. The crash phase
+babysits the reap window (~2 min); `SKIP_CRASH=1 make dev-e2e` skips it. On
+failure it dumps screenshots, per-peer browser consoles, and each peer's
+in-call diagnostics (the ⚙ log) to `/tmp/meet-dev-e2e/`.
 
 Run this before shipping anything that touches the contract, `useCall.ts`, or
 `webrtc.ts` — in one afternoon it caught an SSO-trust regression, a

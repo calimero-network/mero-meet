@@ -303,11 +303,11 @@ describe("roster reconciliation", () => {
 });
 
 describe("ghost-peer reconnection ladder", () => {
-  it("failed → immediate ICE restart; still down after the window → full rebuild with a fresh handshake", async () => {
+  it("IMPOLITE side leads: failed → immediate ICE restart; still down after the window → full rebuild", async () => {
     vi.useFakeTimers();
     const { engine, cbs } = makeEngine();
     await engine.start();
-    engine.syncPeers([PEER_POLITE]);
+    engine.syncPeers([PEER_IMPOLITE]);
     const pc = FakePC.all[0];
 
     pc.setConn("failed");
@@ -320,7 +320,7 @@ describe("ghost-peer reconnection ladder", () => {
     expect(await peerCount(engine)).toBe(1);
     // Rebuild keeps the last frame on the tile ("reconnecting…" overlay) —
     // the stream-cleared callback must NOT fire for a rebuild.
-    expect(cbs.onRemoteStream).not.toHaveBeenCalledWith(PEER_POLITE, null);
+    expect(cbs.onRemoteStream).not.toHaveBeenCalledWith(PEER_IMPOLITE, null);
     // Rebuilt pc published our tracks → fresh offer goes out.
     await vi.advanceTimersByTimeAsync(0);
     const offers = cbs.onSignal.mock.calls.filter(([s]) => (s as OutSignal).kind === "offer");
@@ -343,7 +343,7 @@ describe("ghost-peer reconnection ladder", () => {
   it("disconnected gets the short-fuse ICE restart, then rebuild if still down", async () => {
     vi.useFakeTimers();
     const { engine } = makeEngine();
-    engine.syncPeers([PEER_POLITE]);
+    engine.syncPeers([PEER_IMPOLITE]);
     const pc = FakePC.all[0];
 
     pc.setConn("disconnected");
@@ -353,6 +353,171 @@ describe("ghost-peer reconnection ladder", () => {
     await vi.advanceTimersByTimeAsync(5500); // 8s total since degradation
     expect(pc.closed).toBe(true);
     expect(FakePC.all.length).toBe(2);
+    expect(await peerCount(engine)).toBe(1);
+  });
+
+  it("POLITE side hangs back (backstop) so the two sides can't duel-restart forever", async () => {
+    // Both sides restarting in lockstep livelocked over the seconds-slow
+    // signaling channel: each restart re-offered and invalidated the answer
+    // the other side had just posted. The polite side must lag the leader.
+    vi.useFakeTimers();
+    const { engine } = makeEngine();
+    await engine.start();
+    engine.syncPeers([PEER_POLITE]); // we are POLITE toward aaa-peer
+    const pc = FakePC.all[0];
+
+    pc.setConn("failed");
+    expect(pc.restartIce).not.toHaveBeenCalled(); // no immediate restart
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(pc.restartIce).toHaveBeenCalledTimes(1); // 5s backstop fuse
+
+    // A restart that lands in time cancels the backstop rebuild…
+    pc.setConn("connected");
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(pc.closed).toBe(false);
+
+    // …and when it doesn't, the rebuild waits 2× the leader's window (16s).
+    pc.setConn("failed");
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(pc.closed).toBe(false); // leader would have rebuilt at 8s
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(pc.closed).toBe(true); // backstop rebuild at 16s
+    expect(await peerCount(engine)).toBe(1);
+  });
+});
+
+describe("call teardown (leave / stop)", () => {
+  it("stop() says bye to every peer, closes them, and releases the camera", async () => {
+    const { engine, signals } = makeEngine();
+    const stream = await engine.start();
+    engine.syncPeers([PEER_POLITE, PEER_IMPOLITE]);
+    await flush();
+
+    engine.stop();
+
+    const byes = signals.filter((s) => s.kind === "bye").map((s) => s.to);
+    expect(byes.sort()).toEqual([PEER_POLITE, PEER_IMPOLITE].sort());
+    expect(FakePC.all.every((pc) => pc.closed)).toBe(true);
+    // Camera light must go off: every local track stopped, stream released.
+    for (const t of (stream as unknown as FakeMediaStream).getTracks()) {
+      expect(t.stop).toHaveBeenCalled();
+    }
+    expect(engine.getLocalStream()).toBeNull();
+    expect(await peerCount(engine)).toBe(0);
+  });
+
+  it("mute/video toggles flip track.enabled without touching peers", async () => {
+    const { engine } = makeEngine();
+    const stream = (await engine.start()) as unknown as FakeMediaStream;
+
+    engine.setMuted(true);
+    expect(stream.getAudioTracks()[0].enabled).toBe(false);
+    engine.setMuted(false);
+    expect(stream.getAudioTracks()[0].enabled).toBe(true);
+
+    engine.setVideo(false);
+    expect(stream.getVideoTracks()[0].enabled).toBe(false);
+    engine.setVideo(true);
+    expect(stream.getVideoTracks()[0].enabled).toBe(true);
+  });
+});
+
+describe("media/peer startup race", () => {
+  it("publishes tracks to a peer created BEFORE local media exists (black-tile fix)", async () => {
+    const { engine, signals } = makeEngine();
+    // Inbound offer lands before getUserMedia resolved — peer exists trackless.
+    await engine.handleSignal(PEER_POLITE, "offer", JSON.stringify({ type: "offer", sdp: "x" }));
+    await flush();
+    const pc = FakePC.all[0];
+    expect(pc.getSenders().some((s) => s.track)).toBe(false);
+
+    // Media arrives: the trackless pc must get our tracks, which schedules a
+    // renegotiation so the other side finally receives our stream.
+    await engine.start();
+    expect(pc.getSenders().filter((s) => s.track)).toHaveLength(2);
+    await flush();
+    expect(signals.some((s) => s.kind === "offer" && s.to === PEER_POLITE)).toBe(true);
+  });
+});
+
+describe("recently-left suppression TTL", () => {
+  it("roster may re-add a departed peer once the suppression window expires", async () => {
+    vi.useFakeTimers();
+    const { engine } = makeEngine();
+    engine.syncPeers([PEER_POLITE]);
+    await engine.handleSignal(PEER_POLITE, "bye", "");
+    expect(await peerCount(engine)).toBe(0);
+
+    // Inside the window the gossip-stale roster cannot resurrect them…
+    await vi.advanceTimersByTimeAsync(19_000);
+    engine.syncPeers([PEER_POLITE]);
+    expect(await peerCount(engine)).toBe(0);
+
+    // …but a roster listing past the TTL is trusted again (a real rejoin whose
+    // offer we somehow missed must not be suppressed forever).
+    await vi.advanceTimersByTimeAsync(2_000);
+    engine.syncPeers([PEER_POLITE]);
+    expect(await peerCount(engine)).toBe(1);
+  });
+});
+
+describe("non-trickle ICE bundling", () => {
+  it("never trickles candidates gathered before the SDP was posted", async () => {
+    const { engine, signals } = makeEngine();
+    engine.syncPeers([PEER_POLITE]); // no local media → no negotiation yet
+    const pc = FakePC.all[0];
+    pc.onicecandidate?.({ candidate: { candidate: "early-c" } });
+    expect(signals.filter((s) => s.kind === "ice")).toHaveLength(0);
+  });
+
+  it("a stalled ICE gathering cannot stall the handshake past the cap", async () => {
+    vi.useFakeTimers();
+    const { engine, signals } = makeEngine();
+    await engine.start();
+    engine.syncPeers([PEER_POLITE]);
+    const pc = FakePC.all[0];
+    pc.iceGatheringState = "gathering"; // never completes
+
+    await vi.advanceTimersByTimeAsync(0); // run the queued negotiationneeded
+    expect(signals.filter((s) => s.kind === "offer")).toHaveLength(0); // still waiting
+
+    await vi.advanceTimersByTimeAsync(2000); // gathering cap elapses
+    expect(signals.filter((s) => s.kind === "offer")).toHaveLength(1); // sent anyway
+  });
+});
+
+describe("force reconnect (rebuildAll)", () => {
+  it("rebuilds every peer from scratch, keeps tiles, and re-offers", async () => {
+    const { engine, cbs, signals } = makeEngine();
+    await engine.start();
+    engine.syncPeers([PEER_POLITE, PEER_IMPOLITE]);
+    await flush();
+    const before = [...FakePC.all];
+    signals.length = 0;
+
+    engine.rebuildAll();
+    await flush();
+
+    expect(before.every((pc) => pc.closed)).toBe(true);
+    expect(FakePC.all.length).toBe(4); // two originals + two rebuilt
+    expect(await peerCount(engine)).toBe(2);
+    // Tiles keep their last frame: no stream-cleared callback on a rebuild.
+    expect(cbs.onRemoteStream).not.toHaveBeenCalledWith(PEER_POLITE, null);
+    expect(cbs.onRemoteStream).not.toHaveBeenCalledWith(PEER_IMPOLITE, null);
+    // Fresh handshakes go out for both peers.
+    const offerTargets = signals.filter((s) => s.kind === "offer").map((s) => s.to);
+    expect(offerTargets.sort()).toEqual([PEER_POLITE, PEER_IMPOLITE].sort());
+  });
+
+  it("clears the recently-left suppression so the next roster sync may re-add", async () => {
+    const { engine } = makeEngine();
+    engine.syncPeers([PEER_POLITE]);
+    await engine.handleSignal(PEER_POLITE, "bye", "");
+    engine.syncPeers([PEER_POLITE]); // suppressed
+    expect(await peerCount(engine)).toBe(0);
+
+    engine.rebuildAll(); // user forced a reconnect — trust the roster again
+    engine.syncPeers([PEER_POLITE]);
     expect(await peerCount(engine)).toBe(1);
   });
 });

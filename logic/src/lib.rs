@@ -487,7 +487,9 @@ impl MeroMeet {
     /// `leave_call` — in TWO passes. Pass 1: a participant silent for
     /// `REAP_STALE_SECS` of room time gets a `ReapMark`. Pass 2 (a later
     /// invocation): if their presence row is STILL frozen after
-    /// `REAP_GRACE_SECS`, they are reaped; any movement clears the mark.
+    /// `REAP_GRACE_SECS`, they are reaped; any movement invalidates the mark
+    /// (its recorded `row_ts` no longer matches — marks are never *removed*,
+    /// since a CRDT tombstone would shadow all future re-marks for that key).
     /// Single-pass reaping killed live calls whenever a member's wall clock
     /// ran ahead (their heartbeat made everyone else look stale) — the exact
     /// "we're both in a call but can't see each other" failure.
@@ -506,7 +508,13 @@ impl MeroMeet {
                 _ => continue, // no presence row — cannot judge, keep
             };
             if room_now.saturating_sub(row_ts) <= REAP_STALE_SECS {
-                let _ = self.reap_marks.remove(&id); // provably alive
+                // Provably alive. Deliberately do NOT remove the stale mark: a
+                // CRDT remove leaves a tombstone that permanently shadows any
+                // later insert under the same key (the UnorderedSet
+                // insert-after-remove bug applies to map keys too), which made
+                // a once-marked-then-recovered member UNREAPABLE forever. The
+                // `mark_row == row_ts` guard below already invalidates an
+                // outdated mark, so leaving it in place is harmless.
                 continue;
             }
             // Copy the mark out (owned) so the read borrow ends before the
@@ -534,7 +542,9 @@ impl MeroMeet {
             return;
         }
         for id in &reaped {
-            let _ = self.reap_marks.remove(id);
+            // The mark is NOT removed (tombstone-shadowing, see above); the
+            // reap bumps their row below, so `mark_row == row_ts` stops
+            // matching and the stale mark can never re-reap them.
             // Clear the ghost's "in call" presence — this IS the roster
             // removal (the roster is derived from `call_id`). The +1 bump
             // stays on their own timeline (they remain stale — we never forge
@@ -1032,6 +1042,10 @@ mod tests {
         // once she is REAP_STALE_SECS silent he marks her, and REAP_GRACE_SECS
         // later — row still frozen — reaps her.
         app.call_as(BOB, |s| s.heartbeat(1070)).unwrap();
+        app.view(|s| {
+            let marks: Vec<_> = s.reap_marks.entries().map(|e| e.map(|(id, m)| (id, m.marked_at, m.row_ts)).collect()).unwrap_or_default();
+            println!("marks after 1070: {marks:?}");
+        });
         assert_eq!(
             app.view(|s| s.get_call_participants()).len(),
             2,
@@ -1148,6 +1162,118 @@ mod tests {
         assert_eq!(app.view(|s| s.active_call_id()), "");
     }
 
+    #[test]
+    fn leave_call_then_rejoin_joins_the_same_session() {
+        // The Google-Meet rejoin: leave, change your mind, come straight back —
+        // you must land in the SAME running session, not fork a new one.
+        // (The old UnorderedSet roster broke exactly this: the leave's
+        // tombstone shadowed the re-insert forever.)
+        let mut app = new_room();
+        app.call_as(ALICE, |s| s.join("Alice".to_owned(), 1000)).unwrap();
+        app.call_as(BOB, |s| s.join("Bob".to_owned(), 1000)).unwrap();
+        let call = app.call_as(ALICE, |s| s.start_call(1001)).unwrap();
+        let _ = app.call_as(BOB, |s| s.start_call(1002)).unwrap();
+
+        app.call_as(BOB, |s| s.leave_call(1010)).unwrap();
+        assert_eq!(app.view(|s| s.get_call_participants()), vec![id_of(ALICE)]);
+
+        let rejoined = app.call_as(BOB, |s| s.start_call(1015)).unwrap();
+        assert_eq!(rejoined, call, "rejoin lands in the running session");
+        assert_eq!(app.view(|s| s.get_call_participants()).len(), 2);
+
+        // And again — rejoin must be repeatable, not a one-shot.
+        app.call_as(BOB, |s| s.leave_call(1020)).unwrap();
+        let again = app.call_as(BOB, |s| s.start_call(1025)).unwrap();
+        assert_eq!(again, call);
+        assert_eq!(app.view(|s| s.get_call_participants()).len(), 2);
+    }
+
+    #[test]
+    fn reaped_member_reasserts_into_the_running_session() {
+        // A member wrongly dropped by the reaper (suspended timers, skew) comes
+        // back: their idempotent start_call must re-add them to the SAME call —
+        // this is the frontend's self-heal path ("roster lost us → start_call").
+        let mut app = new_room();
+        app.call_as(ALICE, |s| s.join("Alice".to_owned(), 1000)).unwrap();
+        app.call_as(BOB, |s| s.join("Bob".to_owned(), 1000)).unwrap();
+        let call = app.call_as(ALICE, |s| s.start_call(1001)).unwrap();
+        let _ = app.call_as(BOB, |s| s.start_call(1002)).unwrap();
+
+        // Alice's window is suspended: Bob marks (1070) then reaps (1105) her.
+        app.call_as(BOB, |s| s.heartbeat(1070)).unwrap();
+        app.call_as(BOB, |s| s.heartbeat(1105)).unwrap();
+        assert_eq!(app.view(|s| s.get_call_participants()), vec![id_of(BOB)]);
+
+        // She wakes up and re-asserts membership.
+        let back = app.call_as(ALICE, |s| s.start_call(1110)).unwrap();
+        assert_eq!(back, call, "re-assert joins the same running session");
+        assert_eq!(app.view(|s| s.get_call_participants()).len(), 2);
+        // And she is no longer marked-for-death: Bob's next beats keep her.
+        app.call_as(BOB, |s| s.heartbeat(1115)).unwrap();
+        assert_eq!(app.view(|s| s.get_call_participants()).len(), 2);
+    }
+
+    #[test]
+    fn active_signaling_defers_the_reaper_but_is_not_immortality() {
+        // A peer whose heartbeats are throttled (minimized window) but who is
+        // actively negotiating must not be reaped mid-handshake…
+        let mut app = new_room();
+        app.call_as(ALICE, |s| s.join("Alice".to_owned(), 1000)).unwrap();
+        app.call_as(BOB, |s| s.join("Bob".to_owned(), 1000)).unwrap();
+        let _ = app.call_as(ALICE, |s| s.start_call(1001)).unwrap();
+        let _ = app.call_as(BOB, |s| s.start_call(1002)).unwrap();
+
+        app.call_as(BOB, |s| s.heartbeat(1070)).unwrap(); // Alice marked
+        app.call_as(ALICE, |s| {
+            s.post_signal(id_of(BOB), "offer".to_owned(), "sdp".to_owned(), "c".to_owned(), 1075)
+        })
+        .unwrap(); // …but her signal moves her row
+        app.call_as(BOB, |s| s.heartbeat(1105)).unwrap(); // past the old grace
+        assert_eq!(
+            app.view(|s| s.get_call_participants()).len(),
+            2,
+            "signaling peer survived the reap window"
+        );
+
+        // …but once she goes truly silent, the mark+grace ladder still gets her.
+        app.call_as(BOB, |s| s.heartbeat(1140)).unwrap(); // stale again → marked
+        app.call_as(BOB, |s| s.heartbeat(1175)).unwrap(); // grace elapsed → reaped
+        assert_eq!(app.view(|s| s.get_call_participants()), vec![id_of(BOB)]);
+    }
+
+    #[test]
+    fn rejoining_the_room_preserves_call_membership_and_av_state() {
+        // join() is the refresh path (F5 re-runs it). It must upsert — a
+        // refresh mid-call cannot silently kick you out of the call or reset
+        // your mute/camera choices.
+        let mut app = new_room();
+        app.call_as(ALICE, |s| s.join("Alice".to_owned(), 1000)).unwrap();
+        let call = app.call_as(ALICE, |s| s.start_call(1001)).unwrap();
+        app.call_as(ALICE, |s| s.set_state(Some(true), Some(false), None, 1002)).unwrap();
+
+        app.call_as(ALICE, |s| s.join("Alice".to_owned(), 1005)).unwrap();
+
+        assert_eq!(app.view(|s| s.get_call_participants()), vec![id_of(ALICE)]);
+        assert_eq!(app.view(|s| s.active_call_id()), call);
+        let lobby = app.view(|s| s.get_lobby(1006));
+        let alice = lobby.members.iter().find(|m| m.member_id == id_of(ALICE)).unwrap();
+        assert!(alice.muted, "mute choice survives a refresh");
+        assert!(!alice.video_on, "camera choice survives a refresh");
+    }
+
+    #[test]
+    fn leave_call_by_a_non_participant_does_not_disturb_the_call() {
+        let mut app = new_room();
+        app.call_as(ALICE, |s| s.join("Alice".to_owned(), 1000)).unwrap();
+        app.call_as(BOB, |s| s.join("Bob".to_owned(), 1000)).unwrap();
+        let call = app.call_as(ALICE, |s| s.start_call(1001)).unwrap();
+
+        // Bob never joined the call; a stray leave_call (e.g. pagehide) is a no-op.
+        app.call_as(BOB, |s| s.leave_call(1002)).unwrap();
+        assert_eq!(app.view(|s| s.active_call_id()), call);
+        assert_eq!(app.view(|s| s.get_call_participants()), vec![id_of(ALICE)]);
+    }
+
     // ── Signaling ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -1180,6 +1306,17 @@ mod tests {
         assert_eq!(alices.len(), 1);
         let none = app.call_as(ALICE, |s| s.get_signals(alices[0].seq));
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn oversized_signal_payload_is_rejected() {
+        let mut app = new_room();
+        app.call_as(ALICE, |s| s.join("Alice".to_owned(), 1000)).unwrap();
+        let huge = "x".repeat(64 * 1024 + 1);
+        let denied = app.call_as(ALICE, |s| {
+            s.post_signal(id_of(BOB), "offer".to_owned(), huge, "c1".to_owned(), 1001)
+        });
+        assert!(denied.is_err(), "payloads past the sanity cap must bounce");
     }
 
     #[test]

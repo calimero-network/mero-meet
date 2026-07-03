@@ -3,7 +3,10 @@
 // Drives peer A (node1) and peer B (node2) in two isolated Playwright browser
 // contexts with fake cameras, and asserts actual video frames flow — then
 // exercises the full lifecycle that has historically broken: leave → rejoin in
-// BOTH directions, and everyone-leaves → the call must die.
+// BOTH directions, rapid leave→rejoin churn, mute propagation, force
+// reconnect, a mid-call page refresh (auto-resume), everyone-leaves → the call
+// must die, and finally an ungraceful renderer crash → the survivor's tile
+// must drop via the ghost/reap ladder (SKIP_CRASH=1 skips that slow phase).
 //
 // This is the automated twin of `make dev-call` (which opens the same two
 // peers in visible Chrome windows for eyeballing). Run it via:
@@ -95,6 +98,13 @@ const browser = await chromium.launch({
     "--use-fake-device-for-media-stream",
     "--use-fake-ui-for-media-stream",
     "--autoplay-policy=no-user-gesture-required",
+    // Both peers live on THIS host. Chrome hides host ICE candidates behind
+    // mDNS `.local` names; resolving the peer's names needs multicast DNS,
+    // which is unreliable here (UDP/5353 contention; VPN lockdown blocks it)
+    // — media phases flaked in waves while signaling stayed healthy. Plain
+    // host candidates connect the two local browsers deterministically.
+    "--disable-features=WebRtcHideLocalIpsWithMdns",
+    "--allow-loopback-in-peer-connection",
   ],
 });
 const mkPeer = async (label) => {
@@ -145,7 +155,36 @@ try {
   await waitForLiveVideos(b, 2, 90000, "Bob after Ana rejoined");
   log("PHASE 4 OK ✅");
 
-  log("PHASE 5 — both leave; room must fall back to 'Start call' (dead call killed)");
+  log("PHASE 5 — rapid churn: Bob leaves and rejoins IMMEDIATELY (suppression bypass)");
+  // No waiting for Ana's tile to drop: the roster still lists Bob as
+  // recently-left when his fresh offer arrives — it must bypass the
+  // suppression and reconnect, not be written off as a gossip-stale ghost.
+  await leaveCall(b);
+  await rejoin(b);
+  await waitForLiveVideos(b, 2, 90000, "Bob after instant rejoin");
+  await waitForLiveVideos(a, 2, 90000, "Ana after Bob's instant rejoin");
+  log("PHASE 5 OK ✅");
+
+  log("PHASE 6 — mute propagates: Bob mutes, Ana's tile shows the badge");
+  await b.click('button[aria-label="Mute"]');
+  await a.waitForSelector('span[title="Muted"]', { timeout: 30000 });
+  await b.click('button[aria-label="Unmute"]');
+  await a.waitForSelector('span[title="Muted"]', { state: "detached", timeout: 30000 });
+  log("PHASE 6 OK ✅");
+
+  log("PHASE 7 — force reconnect: Ana redials, media must re-flow both ways");
+  await a.click('button[aria-label="Reconnect"]');
+  await waitForLiveVideos(a, 2, 90000, "Ana after force reconnect");
+  await waitForLiveVideos(b, 2, 90000, "Bob after Ana's force reconnect");
+  log("PHASE 7 OK ✅");
+
+  log("PHASE 8 — F5 mid-call: Ana refreshes and must auto-rejoin (no clicks)");
+  await a.reload({ waitUntil: "domcontentloaded" });
+  await waitForLiveVideos(a, 2, 90000, "Ana after refresh (auto-resumed)");
+  await waitForLiveVideos(b, 2, 90000, "Bob after Ana's refresh");
+  log("PHASE 8 OK ✅");
+
+  log("PHASE 9 — both leave; room must fall back to 'Start call' (dead call killed)");
   await leaveCall(a);
   await leaveCall(b);
   await a.waitForTimeout(4000);
@@ -154,7 +193,57 @@ try {
   if (!/start call/i.test(btnA || "") || !/start call/i.test(btnB || "")) {
     throw new Error(`expected 'Start call' on both after everyone left, got A='${btnA}' B='${btnB}'`);
   }
-  log("PHASE 5 OK ✅");
+  log("PHASE 9 OK ✅");
+
+  if (process.env.SKIP_CRASH === "1") {
+    log("PHASE 10 — skipped (SKIP_CRASH=1)");
+  } else {
+    log("PHASE 10 — ungraceful crash: Bob's renderer dies, Ana must shed his tile");
+    // A real crash: no pagehide, no leave_call, no bye — heartbeats just stop.
+    // Ana must drop Bob via the ghost/reap ladder (60s silence + reap grace),
+    // NOT keep a frozen tile forever ("phantom participant").
+    await rejoin(a);
+    await rejoin(b);
+    await waitForLiveVideos(a, 2, 90000, "Ana (pre-crash call up)");
+    await waitForLiveVideos(b, 2, 90000, "Bob (pre-crash call up)");
+    const cdp = await b.context().newCDPSession(b);
+    // Fire-and-forget with a timeout: the crashed renderer can never ACK the
+    // CDP command, so the send() promise may settle NEITHER way — a bare await
+    // hung the harness here forever.
+    await Promise.race([
+      cdp.send("Page.crash").catch(() => {}),
+      new Promise((r) => setTimeout(r, 3000)),
+    ]);
+    log("  Bob's renderer crashed; waiting for Ana to shed the ghost…");
+    const t2 = Date.now();
+    while ((await liveVideoCount(a)) > 1) {
+      if (Date.now() - t2 > 150000) {
+        throw new Error("Ana still shows crashed Bob 150s after his renderer died");
+      }
+      await a.waitForTimeout(5000);
+    }
+    log(`  ghost shed after ${((Date.now() - t2) / 1000).toFixed(0)}s`);
+    // Ana must stay in the call until the CONTRACT reaper also drops Bob
+    // (her heartbeats drive it: ~60s stale + 30s grace). If she left first,
+    // nobody would be beating and the phantom call would survive forever.
+    const reapBudget = 115000 - (Date.now() - t2);
+    if (reapBudget > 0) {
+      log(`  staying in-call ${(reapBudget / 1000).toFixed(0)}s more so the reaper finishes…`);
+      await a.waitForTimeout(reapBudget);
+    }
+    await leaveCall(a);
+    // The survivor's leave must now kill the (empty) call for good.
+    const t3 = Date.now();
+    for (;;) {
+      const btn = (await a.textContent("header button:has-text('call')"))?.trim();
+      if (/start call/i.test(btn || "")) break;
+      if (Date.now() - t3 > 30000) {
+        throw new Error(`expected 'Start call' after the survivor left, got '${btn}' (phantom call?)`);
+      }
+      await a.waitForTimeout(3000);
+    }
+    log("PHASE 10 OK ✅");
+  }
 
   log("ALL PHASES PASSED 🎉");
 } catch (e) {

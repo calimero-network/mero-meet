@@ -86,7 +86,16 @@ fi
 CHROME="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 [ -x "$CHROME" ] || { red "Chrome not found at: $CHROME (set CHROME_BIN). Or use: ./scripts/dev-call.sh --print"; exit 1; }
 
+# WebRtcHideLocalIpsWithMdns is disabled because both peers run on THIS host:
+# Chrome hides host ICE candidates behind mDNS `.local` names, and resolving
+# the peer's names needs multicast DNS — which is unreliable on this setup
+# (UDP/5353 contention; VPNs in lockdown block it entirely). With it disabled,
+# the two local Chromes connect over plain host candidates immediately instead
+# of flaking in waves whenever mDNS/VPN misbehaves. Harness-only; real users
+# on separate machines use srflx/TURN.
 COMMON=(--use-fake-device-for-media-stream --use-fake-ui-for-media-stream
+        --disable-features=WebRtcHideLocalIpsWithMdns
+        --allow-loopback-in-peer-connection
         --no-first-run --no-default-browser-check --new-window)
 
 step "Launching Peer A (node1)"
