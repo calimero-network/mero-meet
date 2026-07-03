@@ -86,16 +86,30 @@ class FakePC {
   getSenders() {
     return this.senders;
   }
-  async setLocalDescription(desc?: Desc) {
+  /** Test hooks: fail the next N setRemoteDescription calls (Safari-style
+   *  no-implicit-rollback), and/or delay them by a macrotask. */
+  failNextSRD = 0;
+  delaySRD = false;
+  async setLocalDescription(desc?: Desc | { type: "rollback" }) {
+    if (desc && desc.type === "rollback") {
+      this.localDescription = null;
+      this.signalingState = "stable";
+      return;
+    }
     const answering = this.remoteDescription?.type === "offer";
-    this.localDescription = desc ?? { type: answering ? "answer" : "offer", sdp: "sdp" };
+    this.localDescription = (desc as Desc) ?? { type: answering ? "answer" : "offer", sdp: "sdp" };
     this.signalingState = answering ? "stable" : "have-local-offer";
   }
   async setRemoteDescription(desc: Desc) {
+    if (this.delaySRD) await new Promise((r) => setTimeout(r, 5));
+    if (this.failNextSRD > 0) {
+      this.failNextSRD -= 1;
+      throw new DOMException("Cannot set remote offer in state have-local-offer", "InvalidStateError");
+    }
     this.remoteDescription = desc;
     this.signalingState = desc.type === "offer" ? "have-remote-offer" : "stable";
   }
-  async addIceCandidate(_c: unknown) {}
+  addIceCandidate = vi.fn(async (_c: unknown) => {});
   addEventListener(_e: string, _f: () => void) {}
   removeEventListener(_e: string, _f: () => void) {}
   close() {
@@ -391,6 +405,119 @@ describe("ghost-peer reconnection ladder", () => {
     await vi.advanceTimersByTimeAsync(1_500);
     expect(pc.closed).toBe(true); // backstop rebuild at 16s
     expect(await peerCount(engine)).toBe(1);
+  });
+});
+
+describe("perfect-negotiation completeness (MDN reference parity)", () => {
+  it("an offer landing while we apply the peer's ANSWER is the next round, not glare (impolite must not ignore it)", async () => {
+    const { engine, signals } = makeEngine();
+    await engine.start();
+    engine.syncPeers([PEER_IMPOLITE]); // we are IMPOLITE → glare would be ignored
+    await flush();
+    const pc = FakePC.all[0];
+    expect(pc.signalingState).toBe("have-local-offer"); // our offer is out
+
+    // Their answer and their NEXT offer race in over slow gossip: the offer
+    // arrives while setRemoteDescription(answer) is still in flight.
+    pc.delaySRD = true;
+    const answerP = engine.handleSignal(
+      PEER_IMPOLITE, "answer", JSON.stringify({ type: "answer", sdp: "a" }),
+    );
+    const offerP = engine.handleSignal(
+      PEER_IMPOLITE, "offer", JSON.stringify({ type: "offer", sdp: "next" }),
+    );
+    await Promise.all([answerP, offerP]);
+    await flush();
+
+    // Without isSettingRemoteAnswerPending this offer was dropped as glare and
+    // the renegotiation (their camera swap, their ICE restart…) never happened.
+    expect(signals.filter((s) => s.kind === "answer" && s.to === PEER_IMPOLITE)).toHaveLength(1);
+  });
+
+  it("queues candidates that arrive before the remote description and flushes them after it", async () => {
+    const { engine } = makeEngine();
+    engine.syncPeers([PEER_POLITE]); // fresh pc, NO remote description yet
+    const pc = FakePC.all[0];
+
+    await engine.handleSignal(PEER_POLITE, "ice", JSON.stringify({ candidate: "early-1" }));
+    await engine.handleSignal(PEER_POLITE, "ice", JSON.stringify({ candidate: "early-2" }));
+    // Applying now would throw (no ice-ufrag/pwd) — must be held, not dropped.
+    expect(pc.addIceCandidate).not.toHaveBeenCalled();
+
+    await engine.handleSignal(PEER_POLITE, "offer", JSON.stringify({ type: "offer", sdp: "x" }));
+    await flush();
+    expect(pc.addIceCandidate).toHaveBeenCalledTimes(2);
+    expect(pc.addIceCandidate).toHaveBeenCalledWith({ candidate: "early-1" });
+  });
+
+  it("polite glare on a webview WITHOUT implicit rollback (WKWebView) falls back to explicit rollback", async () => {
+    const { engine, signals } = makeEngine();
+    await engine.start();
+    engine.syncPeers([PEER_POLITE]); // we are POLITE → must yield on glare
+    await flush();
+    const pc = FakePC.all[0];
+    expect(pc.signalingState).toBe("have-local-offer");
+
+    // Safari/WKWebView throws InvalidStateError instead of implicitly rolling
+    // back — previously swallowed, silently killing the handshake on desktop.
+    pc.failNextSRD = 1;
+    signals.length = 0;
+    await engine.handleSignal(PEER_POLITE, "offer", JSON.stringify({ type: "offer", sdp: "y" }));
+    await flush();
+
+    expect(pc.remoteDescription?.sdp).toBe("y"); // applied after explicit rollback
+    expect(signals.filter((s) => s.kind === "answer" && s.to === PEER_POLITE)).toHaveLength(1);
+    expect(pc.closed).toBe(false); // resolved without a rebuild
+  });
+});
+
+describe("handshake timeout (lost-offer recovery)", () => {
+  it("rebuilds when a posted offer never gets an answer (signal lost over gossip)", async () => {
+    vi.useFakeTimers();
+    const { engine, signals } = makeEngine();
+    await engine.start();
+    engine.syncPeers([PEER_IMPOLITE]); // impolite → 12s handshake window
+    await vi.advanceTimersByTimeAsync(0);
+    const pc = FakePC.all[0];
+    expect(signals.filter((s) => s.kind === "offer")).toHaveLength(1);
+
+    // Nothing ever comes back. The pc sits in "new" — no disconnected/failed
+    // event will EVER fire, so only this watchdog can save the call.
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(pc.closed).toBe(true);
+    expect(FakePC.all.length).toBe(2); // fresh pc, fresh offer
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signals.filter((s) => s.kind === "offer").length).toBeGreaterThanOrEqual(2);
+    expect(await peerCount(engine)).toBe(1);
+  });
+
+  it("an answer that arrives in time disarms the watchdog", async () => {
+    vi.useFakeTimers();
+    const { engine } = makeEngine();
+    await engine.start();
+    engine.syncPeers([PEER_IMPOLITE]);
+    await vi.advanceTimersByTimeAsync(0);
+    const pc = FakePC.all[0];
+
+    await engine.handleSignal(PEER_IMPOLITE, "answer", JSON.stringify({ type: "answer", sdp: "a" }));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(pc.closed).toBe(false);
+    expect(FakePC.all.length).toBe(1);
+  });
+
+  it("the polite side waits 2× so both ends never rebuild in lockstep", async () => {
+    vi.useFakeTimers();
+    const { engine } = makeEngine();
+    await engine.start();
+    engine.syncPeers([PEER_POLITE]); // polite → 24s window
+    await vi.advanceTimersByTimeAsync(0);
+    const pc = FakePC.all[0];
+
+    await vi.advanceTimersByTimeAsync(13_000);
+    expect(pc.closed).toBe(false); // impolite would have rebuilt at 12s
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(pc.closed).toBe(true); // 24s backstop
+    expect(FakePC.all.length).toBe(2);
   });
 });
 

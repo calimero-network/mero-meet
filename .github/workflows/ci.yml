@@ -32,6 +32,34 @@ jobs:
       - run: pnpm exec vitest run
       - run: pnpm build
 
+  # The REAL WebRTC stack in a real headless Chromium on this runner: two
+  # CallEngines in one page, wired through a lossy/laggy signaling bridge that
+  # emulates the Calimero gossip channel (300ms latency, injectable loss).
+  # Exercises real ICE, real fake-camera media with decoded-frame assertions,
+  # deliberate glare, force reconnect, a LOST offer (the handshake watchdog
+  # must self-heal the call), and bye teardown — no Calimero node needed, so
+  # it runs on every PR in ~1 minute.
+  engine-loopback:
+    name: Engine e2e (real browser, loopback signaling)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - run: node scripts/engine-loopback-e2e.mjs
+
   logic:
     name: Logic (contract tests + WASM build)
     runs-on: ubuntu-latest

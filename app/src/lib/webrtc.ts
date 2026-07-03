@@ -74,6 +74,17 @@ interface PeerState {
   sdpSent: boolean;
   /** Armed while the connection is degraded; fires a from-scratch rebuild. */
   rebuildTimer: ReturnType<typeof setTimeout> | null;
+  /** MDN perfect negotiation: an inbound offer that lands while we are
+   *  applying the peer's ANSWER is not glare — it is the next negotiation. */
+  isSettingRemoteAnswerPending: boolean;
+  /** Trickled candidates that arrived before the remote description; applying
+   *  them early is an error (no ice-ufrag/pwd yet) and dropping them loses
+   *  connectivity — they are queued and flushed after setRemoteDescription. */
+  pendingCandidates: RTCIceCandidateInit[];
+  /** Armed when we post an offer; fires if no answer ever arrives (a lost
+   *  signal left the pc in "new"/"connecting" forever — no other recovery
+   *  timer covers a connection that never got up in the first place). */
+  handshakeTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const DEFAULT_ICE: RTCIceServer[] = [
@@ -115,6 +126,15 @@ const REBUILD_AFTER_MS = 8000;
  * entry (see handleSignal).
  */
 const RECENTLY_LEFT_TTL_MS = 20_000;
+
+/**
+ * How long a posted OFFER may go unanswered before the peer is rebuilt with a
+ * fresh handshake. Signals ride CRDT gossip (seconds, occasionally lost); an
+ * unanswered offer used to leave the pc in "new" forever — the degraded-state
+ * ladder never fires for a connection that never came up. Politeness-staggered
+ * like the rest of recovery so both sides don't rebuild in lockstep.
+ */
+const HANDSHAKE_TIMEOUT_MS = 12_000;
 
 export class CallEngine {
   private readonly selfId: string;
@@ -174,6 +194,43 @@ export class CallEngine {
         /* pc may be closing */
       }
     });
+  }
+
+  /**
+   * Watchdog for an offer that never gets an answer (lost over the gossip
+   * channel). If the signaling state is still "have-local-offer" when it
+   * fires — no answer applied, no glare rollback — rebuild from scratch,
+   * which re-mints TURN creds and re-offers. The polite side waits 2× so the
+   * two sides never rebuild in lockstep.
+   */
+  private armHandshakeTimer(peerId: string, state: PeerState): void {
+    if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
+    const wait = state.polite ? HANDSHAKE_TIMEOUT_MS * 2 : HANDSHAKE_TIMEOUT_MS;
+    state.handshakeTimer = setTimeout(() => {
+      state.handshakeTimer = null;
+      if (this.peers.get(peerId) !== state) return; // rebuilt/left meanwhile
+      const conn = state.pc.connectionState;
+      if (conn === "connected") return;
+      // Mid-handshake states that ARE progressing get covered by either the
+      // degraded-state ladder (connecting → failed) or the peer's own side;
+      // we fire on the two stuck shapes: an unanswered local offer, or a pc
+      // that never negotiated at all (no descriptions in either direction).
+      const stuckOffer = state.pc.signalingState === "have-local-offer";
+      const neverNegotiated =
+        state.pc.signalingState === "stable" &&
+        !state.pc.remoteDescription &&
+        !state.makingOffer &&
+        conn !== "connecting";
+      if (!stuckOffer && !neverNegotiated) return;
+      this.diag(
+        "peer",
+        `${peerId.slice(0, 8)} handshake dead after ${wait / 1000}s (${stuckOffer ? "offer unanswered" : "never negotiated"}) — rebuilding`,
+      );
+      this.closePeer(peerId, "handshake timeout", true);
+      void this.refreshIceServers().then(() => {
+        if (!this.peers.has(peerId)) this.addPeer(peerId);
+      });
+    }, wait);
   }
 
   /**
@@ -338,6 +395,9 @@ export class CallEngine {
       missingStreak: 0,
       sdpSent: false,
       rebuildTimer: null,
+      isSettingRemoteAnswerPending: false,
+      pendingCandidates: [],
+      handshakeTimer: null,
     };
     this.peers.set(peerId, state);
     this.recentlyLeft.delete(peerId); // any add is authoritative (e.g. a rejoin offer)
@@ -346,6 +406,11 @@ export class CallEngine {
     // keys off "any peer not yet connected", and the first real
     // connectionstatechange only fires once the answer is already back.
     this.cbs.onPeerStateChange?.(peerId, pc.connectionState);
+
+    // Handshake watchdog from birth: a peer that never gets to negotiate at
+    // all (negotiationneeded threw, our offer OR their answer lost in gossip)
+    // sits in "new" forever — no disconnected/failed event will ever fire.
+    this.armHandshakeTimer(peerId, state);
 
     // Publish our tracks — this schedules `negotiationneeded`.
     this.local?.getTracks().forEach((track) => pc.addTrack(track, this.local!));
@@ -380,9 +445,13 @@ export class CallEngine {
             payload: JSON.stringify(pc.localDescription),
           });
           state.sdpSent = true;
+          this.armHandshakeTimer(peerId, state);
         }
-      } catch {
-        /* negotiation will be retried on the next event */
+      } catch (err) {
+        // Surface it — a silently-swallowed negotiation failure left a fresh
+        // pc wedged in "new" with no offer ever sent (seen live after a
+        // rebuild). The handshake watchdog armed below rebuilds it.
+        this.diag("error", `negotiation with ${peerId.slice(0, 8)} failed: ${err instanceof Error ? err.message : err}`);
       } finally {
         state.makingOffer = false;
       }
@@ -394,11 +463,15 @@ export class CallEngine {
       const st = pc.connectionState;
 
       if (st === "connected") {
-        // Healed — stand down the rebuild.
+        // Healed — stand down the rebuild and handshake watchdogs.
         state.missingStreak = 0;
         if (state.rebuildTimer) {
           clearTimeout(state.rebuildTimer);
           state.rebuildTimer = null;
+        }
+        if (state.handshakeTimer) {
+          clearTimeout(state.handshakeTimer);
+          state.handshakeTimer = null;
         }
         return;
       }
@@ -507,13 +580,56 @@ export class CallEngine {
     try {
       if (kind === "offer" || kind === "answer") {
         const desc = JSON.parse(payload) as RTCSessionDescriptionInit;
-        const offerCollision =
-          desc.type === "offer" &&
-          (state.makingOffer || pc.signalingState !== "stable");
+        // MDN perfect negotiation: an offer landing while we are applying the
+        // peer's ANSWER is the next negotiation round, not glare.
+        const readyForOffer =
+          !state.makingOffer &&
+          (pc.signalingState === "stable" || state.isSettingRemoteAnswerPending);
+        const offerCollision = desc.type === "offer" && !readyForOffer;
         state.ignoreOffer = !state.polite && offerCollision;
         if (state.ignoreOffer) return;
 
-        await pc.setRemoteDescription(desc);
+        state.isSettingRemoteAnswerPending = desc.type === "answer";
+        try {
+          await pc.setRemoteDescription(desc);
+        } catch (err) {
+          state.isSettingRemoteAnswerPending = false;
+          if (desc.type === "offer" && offerCollision && state.polite) {
+            // WKWebView (the desktop webview) does not implement the implicit
+            // rollback the modern pattern relies on — glare THROWS here and
+            // used to be swallowed, silently killing the handshake. Fall back
+            // to an explicit rollback; if even that fails, rebuild the peer.
+            try {
+              await pc.setLocalDescription({ type: "rollback" } as RTCSessionDescriptionInit);
+              await pc.setRemoteDescription(desc);
+              this.diag("peer", `${from.slice(0, 8)} glare resolved via explicit rollback`);
+            } catch {
+              this.diag("peer", `${from.slice(0, 8)} rollback unsupported — rebuilding to resolve glare`);
+              this.rebuildPeer(from, "glare (no rollback support)");
+              return;
+            }
+          } else {
+            throw err;
+          }
+        }
+        state.isSettingRemoteAnswerPending = false;
+        // An applied description answers/settles our outstanding offer.
+        if (state.handshakeTimer) {
+          clearTimeout(state.handshakeTimer);
+          state.handshakeTimer = null;
+        }
+        // Trickled candidates that raced this description can be applied now.
+        if (state.pendingCandidates.length) {
+          const queued = state.pendingCandidates;
+          state.pendingCandidates = [];
+          for (const c of queued) {
+            try {
+              await pc.addIceCandidate(c);
+            } catch {
+              /* stale generation — safe to drop after a restart */
+            }
+          }
+        }
         if (desc.type === "offer") {
           state.sdpSent = false;
           await pc.setLocalDescription();
@@ -530,6 +646,13 @@ export class CallEngine {
         }
       } else if (kind === "ice") {
         const candidate = JSON.parse(payload) as RTCIceCandidateInit;
+        if (!pc.remoteDescription) {
+          // Applying a candidate before the remote description is an error
+          // (no ice-ufrag/pwd to match it against) and dropping it can cost
+          // the only working path — queue until the description lands.
+          state.pendingCandidates.push(candidate);
+          return;
+        }
         try {
           await pc.addIceCandidate(candidate);
         } catch (err) {
@@ -553,6 +676,10 @@ export class CallEngine {
     if (state.rebuildTimer) {
       clearTimeout(state.rebuildTimer);
       state.rebuildTimer = null;
+    }
+    if (state.handshakeTimer) {
+      clearTimeout(state.handshakeTimer);
+      state.handshakeTimer = null;
     }
     state.pc.onicecandidate = null;
     state.pc.ontrack = null;
