@@ -23,7 +23,8 @@ use std::str::FromStr;
 
 use calimero_sdk::borsh::{BorshDeserialize, BorshSerialize};
 use calimero_sdk::serde::{Deserialize, Serialize};
-use calimero_sdk::{app, env as sdk_env, PublicKey};
+use calimero_sdk::abi::AbiType;
+use calimero_sdk::{app, env as sdk_env, AccountId, PublicKey};
 use calimero_storage::address::Id;
 use calimero_storage::collections::crdt_meta::MergeError;
 use calimero_storage::collections::rekey::RekeyTarget;
@@ -74,7 +75,7 @@ const MAX_MESSAGE_CHARS: usize = 4096;
 // ── Presence (the lobby) ──────────────────────────────────────────────────────
 
 /// One row in the lobby: a person who is (or recently was) in this room.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[derive(AbiType, BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
 #[borsh(crate = "calimero_sdk::borsh")]
 #[serde(crate = "calimero_sdk::serde")]
 #[serde(rename_all = "camelCase")]
@@ -121,7 +122,7 @@ impl RekeyTarget for Presence {
 /// serialized SDP description or ICE candidate produced by the WebRTC engine on
 /// the sender's machine. Per the WebRTC spec the signaling channel is a black
 /// box; this contract is exactly that black box, made decentralized.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[derive(AbiType, BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
 #[borsh(crate = "calimero_sdk::borsh")]
 #[serde(crate = "calimero_sdk::serde")]
 #[serde(rename_all = "camelCase")]
@@ -163,7 +164,7 @@ impl RekeyTarget for Signal {
 /// movement clears the mark — this is "observed staleness", the contract-side
 /// twin of the frontend's observed-liveness ghost logic, and it is what makes
 /// reaping immune to wall-clock skew between members' machines.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[derive(AbiType, BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
 #[borsh(crate = "calimero_sdk::borsh")]
 #[serde(crate = "calimero_sdk::serde")]
 #[serde(rename_all = "camelCase")]
@@ -194,7 +195,7 @@ impl RekeyTarget for ReapMark {
 
 /// One durable in-room chat message. Broadcast (not addressed): everyone in the
 /// room reads the same rolling history via `get_messages`.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
+#[derive(AbiType, BorshSerialize, BorshDeserialize, Serialize, Deserialize, Clone, Debug)]
 #[borsh(crate = "calimero_sdk::borsh")]
 #[serde(crate = "calimero_sdk::serde")]
 #[serde(rename_all = "camelCase")]
@@ -228,7 +229,7 @@ impl RekeyTarget for ChatMessage {
 
 // ── Views (read-model returned to the frontend) ───────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(AbiType, Serialize, Deserialize, Clone, Debug)]
 #[serde(crate = "calimero_sdk::serde")]
 #[serde(rename_all = "camelCase")]
 pub struct RoomInfo {
@@ -240,7 +241,7 @@ pub struct RoomInfo {
     pub active_call: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(AbiType, Serialize, Deserialize, Clone, Debug)]
 #[serde(crate = "calimero_sdk::serde")]
 #[serde(rename_all = "camelCase")]
 pub struct LobbyView {
@@ -308,6 +309,16 @@ pub struct MeroMeet {
     /// Two-pass reap bookkeeping (see `ReapMark`). NOTE: state-layout change —
     /// rooms created before this field must be recreated (no migrations).
     reap_marks: UnorderedMap<MemberId, ReapMark>,
+    /// member key → the account that device speaks for, self-registered on join
+    /// and on every heartbeat.
+    ///
+    /// `AccessControl` and `Ownable` are keyed by `AccountId` since core rc.20
+    /// (one person, many devices — the gate is the person), while member ids and
+    /// everything the frontend compares are device keys. Nothing on the wire maps
+    /// one to the other, and a device can only ever assert its OWN pairing (both
+    /// halves come from the host), so this is a self-registration rather than an
+    /// admin-maintained table.
+    accounts: UnorderedMap<MemberId, LwwRegister<AccountId>>,
 }
 
 // ── Logic ─────────────────────────────────────────────────────────────────────
@@ -316,9 +327,13 @@ pub struct MeroMeet {
 impl MeroMeet {
     #[app::init]
     pub fn init(name: String) -> MeroMeet {
-        let me = Self::caller();
+        // Ownership and the host tier are ACCOUNT-scoped; member ids stay
+        // device-scoped (see `accounts`).
+        let me = Self::caller_account();
         let mut room_name = Ownable::new_owned_by(me);
         let _ = room_name.insert(LwwRegister::new(name));
+        let mut accounts = UnorderedMap::new();
+        let _ = accounts.insert(Self::caller_id(), LwwRegister::new(me));
         MeroMeet {
             room_name,
             presence: UnorderedMap::new(),
@@ -329,14 +344,72 @@ impl MeroMeet {
             messages: UnorderedMap::new(),
             next_msg_seq: LwwRegister::new(0),
             reap_marks: UnorderedMap::new(),
+            accounts,
         }
     }
 
     // ── Identity & authorization helpers ──────────────────────────────────────
 
     /// The real signer of this invocation. Never trust a client-supplied id.
+    ///
+    /// `device_id()` is the rc.20 successor of `executor_id()` — the same bytes,
+    /// so member ids and the identities the frontend reads from
+    /// `identities-owned` keep matching. Authorization uses
+    /// [`Self::caller_account`]; see `accounts`.
     fn caller() -> PublicKey {
-        sdk_env::executor_id().into()
+        sdk_env::device_id().into()
+    }
+
+    /// The account this call is authorized as — what `AccessControl` and
+    /// `Ownable` gate on. Two devices of one person report the same account.
+    fn caller_account() -> AccountId {
+        AccountId::from(sdk_env::account_id())
+    }
+
+    /// The account a member's device speaks for, if that member has ever
+    /// written to this room.
+    fn account_of(&self, member: &str) -> Option<AccountId> {
+        match self.accounts.get(member) {
+            Ok(Some(reg)) => Some(*reg.get()),
+            _ => None,
+        }
+    }
+
+    /// A member id belonging to `account`, or the account's own string form when
+    /// none is known. Reverse of [`Self::account_of`].
+    fn member_of(&self, account: &AccountId) -> String {
+        if let Ok(entries) = self.accounts.entries() {
+            for (id, known) in entries {
+                if known.get() == account {
+                    return id;
+                }
+            }
+        }
+        account.to_string()
+    }
+
+    /// Resolve a client-supplied member key to the account a grant can name.
+    fn require_account(&self, member: &str) -> app::Result<AccountId> {
+        // Validate the key shape first, so a typo reads as "invalid key" rather
+        // than "hasn't joined".
+        let _ = Self::parse_pk(member)?;
+        match self.account_of(member) {
+            Some(account) => Ok(account),
+            None => app::bail!(
+                "that member hasn't joined this room yet, so their account is unknown"
+            ),
+        }
+    }
+
+    /// Record the caller's device→account pairing. Idempotent: an unchanged
+    /// pairing writes nothing, so the heartbeat path adds no CRDT delta.
+    fn remember_account(&mut self) {
+        let me = Self::caller_id();
+        let account = Self::caller_account();
+        if matches!(self.accounts.get(&me), Ok(Some(known)) if *known.get() == account) {
+            return;
+        }
+        let _ = self.accounts.insert(me, LwwRegister::new(account));
     }
 
     /// Base58 string form of the caller — matches the identity the frontend
@@ -345,13 +418,13 @@ impl MeroMeet {
         String::from(Self::caller())
     }
 
-    fn is_host(&self, who: &PublicKey) -> bool {
+    fn is_host(&self, who: &AccountId) -> bool {
         self.roles.is_admin(who) || self.roles.has_role(ROLE_HOST, who).unwrap_or(false)
     }
 
     /// Gate a room-level / destructive op (end call, mute others, grant host).
     fn require_host(&self) -> app::Result<()> {
-        if self.is_host(&Self::caller()) {
+        if self.is_host(&Self::caller_account()) {
             return Ok(());
         }
         app::bail!("host access is required for this operation");
@@ -409,7 +482,9 @@ impl MeroMeet {
             .count() as u32;
         RoomInfo {
             name: self.room_name_str(),
-            owner: self.room_name.owner().map(String::from),
+            // The owner is an account; report it as the member id clients
+            // already know, falling back to the account's own string form.
+            owner: self.room_name.owner().map(|a| self.member_of(&a)),
             member_count: members.len() as u32,
             online_count: online,
             active_call: self.active_call.get().clone(),
@@ -428,6 +503,9 @@ impl MeroMeet {
     /// Join the room (or refresh my profile). Idempotent: upserts my presence.
     /// `now` is the caller's unix-seconds clock (WASM has no wall clock).
     pub fn join(&mut self, username: String, now: u64) -> app::Result<Presence> {
+        // Register the pairing even for a repeat join: it is what lets a host
+        // name this member in a grant at all.
+        self.remember_account();
         let id = Self::caller_id();
         // Read prior values (if any) into owned locals, then drop the borrow
         // before the mutating insert.
@@ -462,6 +540,9 @@ impl MeroMeet {
     /// participants whose presence went stale, so any living member keeps the
     /// roster honest (events fire only when something was actually reaped).
     pub fn heartbeat(&mut self, now: u64) -> app::Result<()> {
+        // Every client heartbeats, so this is where a member's device→account
+        // pairing reliably becomes known to the rest of the room.
+        self.remember_account();
         let id = Self::caller_id();
         self.touch_presence(&id, now);
         self.reap_stale_participants(now);
@@ -894,7 +975,7 @@ impl MeroMeet {
 
     pub fn grant_host(&mut self, member: MemberId) -> app::Result<()> {
         self.require_host()?;
-        let who = Self::parse_pk(&member)?;
+        let who = self.require_account(&member)?;
         self.roles.grant(ROLE_HOST, who)?;
         app::emit!(Event::RoleUpdated(member));
         Ok(())
@@ -902,16 +983,17 @@ impl MeroMeet {
 
     pub fn revoke_host(&mut self, member: MemberId) -> app::Result<()> {
         self.require_host()?;
-        let who = Self::parse_pk(&member)?;
+        let who = self.require_account(&member)?;
         self.roles.revoke(ROLE_HOST, &who)?;
         app::emit!(Event::RoleUpdated(member));
         Ok(())
     }
 
     pub fn is_member_host(&self, member: MemberId) -> bool {
-        match Self::parse_pk(&member) {
-            Ok(pk) => self.is_host(&pk),
-            Err(_) => false,
+        // Unknown account = no grant can name them = not a host.
+        match self.account_of(&member) {
+            Some(account) => self.is_host(&account),
+            None => false,
         }
     }
 }
@@ -926,6 +1008,11 @@ mod tests {
 
     const ALICE: [u8; 32] = [0x11; 32];
     const BOB: [u8; 32] = [0x22; 32];
+
+    // The host tier is keyed by ACCOUNT since rc.20, and `call_as` keeps the
+    // caller's account on purpose (two devices of one person). A test peer that
+    // must NOT inherit the creator's host rights needs its own account.
+    const BOB_ACCOUNT: [u8; 32] = [0xB0; 32];
 
     fn id_of(bytes: [u8; 32]) -> String {
         bs58::encode(bytes).into_string()
@@ -1150,10 +1237,13 @@ mod tests {
     #[test]
     fn end_call_requires_host() {
         let mut app = new_room();
-        app.call_as(BOB, |s| s.join("Bob".to_owned(), 1000)).unwrap();
-        let _ = app.call_as(BOB, |s| s.start_call(1001)).unwrap();
+        app.call_as_account(BOB_ACCOUNT, BOB, |s| s.join("Bob".to_owned(), 1000)).unwrap();
+        let _ = app.call_as_account(BOB_ACCOUNT, BOB, |s| s.start_call(1001)).unwrap();
 
-        assert!(app.call_as(BOB, |s| s.end_call()).is_err(), "non-host cannot end for everyone");
+        assert!(
+            app.call_as_account(BOB_ACCOUNT, BOB, |s| s.end_call()).is_err(),
+            "non-host cannot end for everyone"
+        );
         app.call(|s| s.end_call()).unwrap(); // creator (admin) can
         assert_eq!(app.view(|s| s.active_call_id()), "");
     }
