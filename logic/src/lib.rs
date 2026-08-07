@@ -280,7 +280,26 @@ pub struct MeroMeet {
     /// Room name lives in `Ownable` so a rename only converges from the owner —
     /// a forged rename from a non-owner is rejected at merge, not just by the
     /// fail-fast API guard. Same pattern as MeroDesign's board name.
+    ///
+    /// Empty until the first rename; read through [`Self::room_name_str`], never
+    /// directly. See [`Self::initial_name`].
     room_name: Ownable<LwwRegister<String>>,
+    /// The name `init` was called with.
+    ///
+    /// **`Ownable::insert` cannot be used inside `init` on core rc.20.** The cell
+    /// is still detached from the state tree there: the writer set is carried
+    /// through by the constructor, but the inserted VALUE is silently dropped —
+    /// `insert` returns `Ok`, and a later read returns `Ok("")`. Core's own tests
+    /// only insert into an already-rooted cell (`Root::new(...)` then
+    /// `.insert(...)`), and `apps/components-demo` constructs its `Ownable`
+    /// without seeding it, so nothing upstream exercises seed-at-init. A plain
+    /// `UnorderedMap`/`LwwRegister` write at init is unaffected — this is
+    /// specific to the permissioned cell's writer-set guard.
+    ///
+    /// So the init name lives here, in a plain register that persists normally,
+    /// and `room_name` takes over from the first owner rename onwards. Written
+    /// once at init and never again.
+    initial_name: LwwRegister<String>,
     /// The lobby: every member who has joined the room, by identity.
     presence: UnorderedMap<MemberId, Presence>,
     /// Signaling mailbox. Keyed by signal id ("sig-{seq}-{from}" — the sender
@@ -330,12 +349,15 @@ impl MeroMeet {
         // Ownership and the host tier are ACCOUNT-scoped; member ids stay
         // device-scoped (see `accounts`).
         let me = Self::caller_account();
-        let mut room_name = Ownable::new_owned_by(me);
-        let _ = room_name.insert(LwwRegister::new(name));
+        // Deliberately NOT `room_name.insert(name)` — see `initial_name`. The
+        // value would be silently dropped here and the room would come up
+        // nameless.
+        let room_name = Ownable::new_owned_by(me);
         let mut accounts = UnorderedMap::new();
         let _ = accounts.insert(Self::caller_id(), LwwRegister::new(me));
         MeroMeet {
             room_name,
+            initial_name: LwwRegister::new(name),
             presence: UnorderedMap::new(),
             signals: UnorderedMap::new(),
             next_seq: LwwRegister::new(0),
@@ -434,8 +456,22 @@ impl MeroMeet {
         PublicKey::from_str(value).map_err(|_| app::err!("invalid member public key"))
     }
 
+    /// The room's display name.
+    ///
+    /// The owner-gated cell wins once it holds anything; before the first rename
+    /// it is empty and the name `init` was given is the answer. See
+    /// [`Self::initial_name`].
     fn room_name_str(&self) -> String {
-        self.room_name.get().map(|r| r.get().clone()).unwrap_or_default()
+        let renamed = self
+            .room_name
+            .get()
+            .map(|r| r.get().clone())
+            .unwrap_or_default();
+        if renamed.is_empty() {
+            self.initial_name.get().clone()
+        } else {
+            renamed
+        }
     }
 
     // ── Room time (skew-proof liveness clock) ──────────────────────────────────
@@ -1449,5 +1485,38 @@ mod tests {
         assert_eq!(sigs.len(), MAX_SIGNALS);
         // Seqs are 1..=cap+over; the `over` lowest were pruned.
         assert_eq!(sigs.first().unwrap().seq, over + 1);
+    }
+
+    /// Regression: the room must report the name it was created with.
+    ///
+    /// `Ownable::insert` inside `init` is silently dropped on rc.20 (see the
+    /// `initial_name` field), so before this test nothing here read the name back
+    /// and every room since the rc.20 bump has been reporting `""`. mero-stream
+    /// hit it because one of its tests DID assert the name.
+    #[test]
+    fn the_room_reports_its_name_before_and_after_a_rename() {
+        let mut app = new_room();
+        assert_eq!(
+            app.call_as(ALICE, |s| s.get_room(1000)).name,
+            "standup",
+            "a freshly created room must report the name init was given"
+        );
+
+        app.call_as(ALICE, |s| s.rename_room("retro".to_owned()))
+            .unwrap();
+        assert_eq!(app.call_as(ALICE, |s| s.get_room(1000)).name, "retro");
+    }
+
+    /// The owner gate still holds: ownership is keyed by ACCOUNT since rc.20, and
+    /// `call_as` deliberately keeps the caller's account (two devices of one
+    /// person), so a peer that must not inherit the creator's rights needs its
+    /// own account.
+    #[test]
+    fn a_non_owner_cannot_rename_the_room() {
+        let mut app = new_room();
+        assert!(app
+            .call_as_account(BOB_ACCOUNT, BOB, |s| s.rename_room("hijacked".to_owned()))
+            .is_err());
+        assert_eq!(app.call_as(ALICE, |s| s.get_room(1000)).name, "standup");
     }
 }
