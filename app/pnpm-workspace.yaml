@@ -1,0 +1,2 @@
+minimumReleaseAgeExclude:
+  - '@calimero-network/mero-js@13.2.1'
