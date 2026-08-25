@@ -17,6 +17,12 @@ nodes:
   count: 2
   image: ghcr.io/calimero-network/merod:0.11.0-rc.24
   prefix: calimero-node
+  # merobox defaults every node to RUST_LOG=debug — roughly 12 MB of container
+  # log per node per couple of minutes, plus real CPU on a 2-vCPU runner that is
+  # also hosting the nodes. `info` keeps the WARN/ERROR lines a failure is
+  # actually diagnosed from. Raise it to `debug` when you need a specific
+  # debug-only marker.
+  log_level: info
   # Off the default 2428/2528 so the workflow doesn't collide with a local
   # dev merod a developer may already be running.
   base_port: 2740
