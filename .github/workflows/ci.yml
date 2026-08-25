@@ -10,6 +10,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# merobox has had a console-verbosity knob since 0.6.30: `quiet` keeps the
+# banners and the final pass/fail summary and drops the per-step API-response
+# dumps. Day to day that is what you want; to get the full detail back, re-run
+# the job with "Enable debug logging" — GitHub sets runner.debug and this flips
+# itself to `verbose`. No second workflow, no flag to remember.
+env:
+  MEROBOX_LOG_LEVEL: ${{ runner.debug == '1' && 'verbose' || 'quiet' }}
+
 jobs:
   app:
     name: App (lint + typecheck + unit tests + build)
@@ -71,8 +79,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # calimero-client-py publishes an sdist and no manylinux wheel, so a cold
+      # `pip install` compiles its Rust extension on the runner — 92 seconds of a
+      # 134-second step, measured. pip stores wheels it builds itself under
+      # ~/.cache/pip/wheels and reuses them, so keying this cache on the exact pins
+      # makes every run after the first a few seconds. Bump the key with the pins.
+      - name: Cache pip (calimero-client-py builds from source)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-merobox-0.6.55-ccpy-0.6.29
       - name: Install merobox
-        run: pip install "merobox==0.6.55" "calimero-client-py==0.6.29"
+        run: pip install -q --disable-pip-version-check "merobox==0.6.55" "calimero-client-py==0.6.29"
       - name: Run signaling e2e (offer/answer/ice through the contract)
         working-directory: workflows
         run: merobox bootstrap run e2e.yml
