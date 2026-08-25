@@ -79,8 +79,15 @@ jobs:
       #
       # It goes through $GITHUB_ENV rather than a workflow-level `env:` because the
       # `runner` context does not exist at workflow or job level — only inside a step.
-      - name: Quiet merobox on the happy path
-        run: echo "MEROBOX_LOG_LEVEL=${{ runner.debug == '1' && 'verbose' || 'quiet' }}" >> "$GITHUB_ENV"
+      - name: Quiet merobox and its nodes on the happy path
+        run: |
+          # merobox's own console output.
+          echo "MEROBOX_LOG_LEVEL=${{ runner.debug == '1' && 'verbose' || 'quiet' }}" >> "$GITHUB_ENV"
+          # RUST_LOG for the merod nodes merobox boots. This has to go on the CLI:
+          # `bootstrap run --log-level` defaults to "debug", so the value is never
+          # None and merobox's `config.get("log_level")` fallback is unreachable — a
+          # `log_level:` key in the workflow YAML is silently ignored.
+          echo "MEROD_LOG=${{ runner.debug == '1' && 'debug' || 'info' }}" >> "$GITHUB_ENV"
       # calimero-client-py publishes an sdist and no manylinux wheel, so a cold
       # `pip install` compiles its Rust extension on the runner — 92 seconds of a
       # 134-second step, measured. pip stores wheels it builds itself under
@@ -95,7 +102,7 @@ jobs:
         run: pip install -q --disable-pip-version-check "merobox==0.6.55" "calimero-client-py==0.6.29"
       - name: Run signaling e2e (offer/answer/ice through the contract)
         working-directory: workflows
-        run: merobox bootstrap run e2e.yml
+        run: merobox bootstrap run --log-level "$MEROD_LOG" e2e.yml
       - name: Stop nodes
         if: always()
         run: merobox stop --all || true
