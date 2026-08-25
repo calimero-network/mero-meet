@@ -10,14 +10,6 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# merobox has had a console-verbosity knob since 0.6.30: `quiet` keeps the
-# banners and the final pass/fail summary and drops the per-step API-response
-# dumps. Day to day that is what you want; to get the full detail back, re-run
-# the job with "Enable debug logging" — GitHub sets runner.debug and this flips
-# itself to `verbose`. No second workflow, no flag to remember.
-env:
-  MEROBOX_LOG_LEVEL: ${{ runner.debug == '1' && 'verbose' || 'quiet' }}
-
 jobs:
   app:
     name: App (lint + typecheck + unit tests + build)
@@ -79,6 +71,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # merobox has had a console-verbosity knob since 0.6.30 (merobox#271): `quiet`
+      # keeps the banners and the final pass/fail summary and drops the per-step
+      # API-response dumps. Day to day that is what you want; to get the full detail
+      # back, re-run the job with "Enable debug logging" and GitHub sets runner.debug,
+      # which flips this to `verbose`. No second workflow, no flag to remember.
+      #
+      # It goes through $GITHUB_ENV rather than a workflow-level `env:` because the
+      # `runner` context does not exist at workflow or job level — only inside a step.
+      - name: Quiet merobox on the happy path
+        run: echo "MEROBOX_LOG_LEVEL=${{ runner.debug == '1' && 'verbose' || 'quiet' }}" >> "$GITHUB_ENV"
       # calimero-client-py publishes an sdist and no manylinux wheel, so a cold
       # `pip install` compiles its Rust extension on the runner — 92 seconds of a
       # 134-second step, measured. pip stores wheels it builds itself under
