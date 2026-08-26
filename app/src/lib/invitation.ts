@@ -1,4 +1,6 @@
 import { createLink, parseIntent } from "@calimero-network/mero-platform";
+import bs58 from "bs58";
+import { deflateSync, inflateSync } from "fflate";
 
 // ── Room invitations ──────────────────────────────────────────────────────────
 //
@@ -11,32 +13,97 @@ import { createLink, parseIntent } from "@calimero-network/mero-platform";
 // We ship the signed invitation as a url-safe base64 token so it pastes cleanly.
 
 /** UTF-8 → url-safe base64 (btoa is Latin1-only, so encode bytes first). */
+
+// ── Invitation codec ─────────────────────────────────────────────────────────
+//
+// The payload is deflate-compressed and base58-encoded into one compact
+// pasteable string — the same wire format mero-blocks, merraria, mero-stream and
+// mero-chat use.
+//
+// Why compress: the signed invitation is JSON carrying three 32-byte arrays
+// rendered as decimal numbers, which is enormously redundant. Plain base64url of
+// it produced a ~930-character link; deflate first and the same invitation is
+// ~540. A near-kilobyte URL survives a paste but wraps badly in a chat window
+// and gets truncated in link previews, so it reads as broken even when it works.
+//
+// Decoding accepts every form this app has ever emitted, because links already
+// shared have to keep working:
+//
+//   1. base58(deflate(JSON))  — what `encodeInvitation` produces now
+//   2. base58(JSON)           — uncompressed base58
+//   3. base64url(JSON)        — what this app produced before this change
+//   4. raw JSON               — hand-assembled, and useful when debugging
+//
+// Pure functions, no session or network access.
+
+const BASE58_ALPHABET =
+  /^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+$/;
+
+/** Compress + base58-encode a JSON string into the shareable form. */
 export function encodeInvitation(raw: string): string {
   const bytes = new TextEncoder().encode(raw);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+  return bs58.encode(deflateSync(bytes, { level: 9 }));
 }
 
+/**
+ * Decode any form listed at the top of this file back to the JSON string.
+ * Returns the input unchanged when nothing matches, so callers that then
+ * `JSON.parse` fail in the same way they always did.
+ */
 export function decodeInvitation(encoded: string): string {
-  const padded = encoded.replace(/-/g, "+").replace(/_/g, "/");
-  const pad = padded.length % 4;
+  const trimmed = encoded.trim();
+  if (!trimmed) return trimmed;
+
+  // Already JSON — nothing to decode.
+  if (trimmed.startsWith("{")) return trimmed;
+
+  // base58, compressed or not. Checked first: a base58 string can also be valid
+  // base64url (the alphabets overlap), and only one of the two is right.
+  if (BASE58_ALPHABET.test(trimmed)) {
+    try {
+      const bytes = bs58.decode(trimmed);
+      try {
+        return new TextDecoder().decode(inflateSync(bytes));
+      } catch {
+        // Uncompressed base58 — but only if it really decoded to JSON. The two
+        // alphabets overlap, so a short string like "YQ" decodes as base58 to
+        // arbitrary bytes; returning those would hand the caller mojibake and
+        // hide a genuinely malformed invitation.
+        const text = new TextDecoder().decode(bytes);
+        if (text.trimStart().startsWith("{")) return text;
+      }
+    } catch {
+      /* not base58 after all — fall through */
+    }
+  }
+
+  // Legacy base64url(JSON), as this app emitted before the switch.
   try {
+    const padded = trimmed.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = padded.length % 4;
     const bin = atob(pad ? padded + "=".repeat(4 - pad) : padded);
     const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
-    return new TextDecoder().decode(bytes);
+    const text = new TextDecoder().decode(bytes);
+    // Only accept it if it actually decoded to JSON: base64-decoding an
+    // arbitrary string succeeds and returns mojibake, which would otherwise
+    // mask a genuinely malformed invitation.
+    if (text.trimStart().startsWith("{")) return text;
   } catch {
-    return encoded;
+    /* not base64url either */
   }
+
+  return trimmed;
 }
 
-/** Encode an invitation object (signed node response + extras like the room name). */
+/** Encode an invitation *object* as a shareable token. */
 export function encodeInvitationObject(obj: unknown): string {
   return encodeInvitation(JSON.stringify(obj));
 }
 
-/** Decode a token from {@link encodeInvitationObject} back to its object. */
-export function decodeInvitationObject<T = Record<string, unknown>>(encoded: string): T {
+/** Decode a token produced by {@link encodeInvitationObject} back to its object. */
+export function decodeInvitationObject<T = Record<string, unknown>>(
+  encoded: string,
+): T {
   return JSON.parse(decodeInvitation(encoded)) as T;
 }
 
